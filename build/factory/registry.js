@@ -1,0 +1,12 @@
+/**
+ * Shared factory registry — single instance of manifest + generated tools.
+ * Both handler.ts and tools.ts import from here instead of loading independently.
+ *
+ * generator.ts resolves the manifest relative to its own module directory, so
+ * this works under npx and .mcpb where cwd is NOT the project root.
+ */
+import { loadManifest, generateTools } from './generator.js';
+import { patches } from './patches.js';
+export const manifest = loadManifest();
+export const generatedTools = generateTools(manifest, patches);
+//# sourceMappingURL=registry.js.map

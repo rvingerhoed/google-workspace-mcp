@@ -23,6 +23,10 @@ export const SERVICE_SCOPE_MAP: Record<string, string[]> = {
     'https://www.googleapis.com/auth/meetings.space.readonly',
     'https://www.googleapis.com/auth/meetings.space.settings',
   ],
+  // Read-only by design (Design Decision 3 in the Google Contacts plan) — the
+  // manifest (contacts.yaml) exposes no create/update/delete operations, so a
+  // write scope would grant privilege the tool can never use.
+  contacts: ['https://www.googleapis.com/auth/contacts.readonly'],
 };
 
 const BASE_SCOPES = [

@@ -1,0 +1,452 @@
+/**
+ * Meet patch — domain-specific hooks for the Meet service.
+ *
+ * Key customizations:
+ * - Conference list: show meeting codes, start/end times, space names
+ * - Participant list: display names with join/leave times
+ * - Transcript entries: inline text with participant display names
+ * - Custom handler: getFullTranscript chains transcripts.list → entries.list
+ *   → participant resolution into a single agent-friendly response
+ */
+import { call } from '../../google/client.js';
+// --- Formatting helpers ---
+/** Extract meeting code from a space name like "spaces/abc-mnop-xyz". */
+function meetingCode(space) {
+    if (!space || typeof space !== 'object')
+        return '';
+    const name = space.meetingCode;
+    return name ? String(name) : '';
+}
+/** Format an ISO timestamp to a short readable form. */
+function shortTime(iso) {
+    if (!iso || typeof iso !== 'string')
+        return '';
+    try {
+        const d = new Date(iso);
+        return d.toLocaleString('en-US', {
+            month: 'short', day: 'numeric',
+            hour: 'numeric', minute: '2-digit',
+            hour12: true,
+        });
+    }
+    catch {
+        return String(iso);
+    }
+}
+/** Format duration between two ISO timestamps. */
+function duration(startIso, endIso) {
+    if (!startIso || !endIso || typeof startIso !== 'string' || typeof endIso !== 'string')
+        return '';
+    try {
+        const ms = new Date(endIso).getTime() - new Date(startIso).getTime();
+        const mins = Math.round(ms / 60000);
+        if (mins < 60)
+            return `${mins}m`;
+        const hrs = Math.floor(mins / 60);
+        const rem = mins % 60;
+        return rem > 0 ? `${hrs}h ${rem}m` : `${hrs}h`;
+    }
+    catch {
+        return '';
+    }
+}
+/** Extract conference ID from resource name like "conferenceRecords/abc123". */
+function conferenceId(name) {
+    return name.replace('conferenceRecords/', '');
+}
+// --- List formatters ---
+function formatConferenceList(data) {
+    const raw = data;
+    const items = (raw?.conferenceRecords ?? []);
+    if (items.length === 0) {
+        return { text: 'No conferences found.', refs: { count: 0 } };
+    }
+    const lines = items.map(conf => {
+        const name = String(conf.name ?? '');
+        const id = conferenceId(name);
+        const code = meetingCode(conf.space);
+        const start = shortTime(conf.startTime);
+        const end = shortTime(conf.endTime);
+        const dur = duration(conf.startTime, conf.endTime);
+        const codePart = code ? ` (${code})` : '';
+        const durPart = dur ? ` [${dur}]` : '';
+        return `${id}${codePart} | ${start} - ${end}${durPart}`;
+    });
+    return {
+        text: `## Conferences (${items.length})\n\n${lines.join('\n')}`,
+        refs: {
+            count: items.length,
+            conferenceId: conferenceId(String(items[0]?.name ?? '')),
+            conferences: items.map(c => ({
+                id: conferenceId(String(c.name ?? '')),
+                meetingCode: meetingCode(c.space),
+                startTime: c.startTime,
+            })),
+        },
+    };
+}
+function formatParticipantList(data) {
+    const raw = data;
+    const items = (raw?.participants ?? []);
+    if (items.length === 0) {
+        return { text: 'No participants found.', refs: { count: 0 } };
+    }
+    const lines = items.map(p => {
+        const signedin = p.signedinUser;
+        const anon = p.anonymousUser;
+        const phone = p.phoneUser;
+        const displayName = signedin?.displayName ?? anon?.displayName ?? phone?.displayName ?? '(unknown)';
+        const joinTime = shortTime(p.earliestStartTime);
+        const leaveTime = shortTime(p.latestEndTime);
+        return `${displayName} | ${joinTime} - ${leaveTime}`;
+    });
+    return {
+        text: `## Participants (${items.length})\n\n${lines.join('\n')}`,
+        refs: {
+            count: items.length,
+            participants: items.map(p => {
+                const signedin = p.signedinUser;
+                return {
+                    name: String(signedin?.displayName ?? '(unknown)'),
+                    user: signedin?.user ? String(signedin.user) : undefined,
+                };
+            }),
+        },
+    };
+}
+function formatTranscriptList(data) {
+    const raw = data;
+    const items = (raw?.transcripts ?? []);
+    if (items.length === 0) {
+        return { text: 'No transcripts found.', refs: { count: 0 } };
+    }
+    const lines = items.map(t => {
+        const name = String(t.name ?? '');
+        const state = String(t.state ?? '');
+        const startTime = shortTime(t.startTime);
+        const endTime = shortTime(t.endTime);
+        const docsUri = t.docsDestination?.exportUri;
+        const docsPart = docsUri ? ` | [Docs](${docsUri})` : '';
+        return `${name} | ${state} | ${startTime} - ${endTime}${docsPart}`;
+    });
+    return {
+        text: `## Transcripts (${items.length})\n\n${lines.join('\n')}`,
+        refs: {
+            count: items.length,
+            transcriptName: String(items[0]?.name ?? ''),
+            transcripts: items.map(t => ({
+                name: t.name,
+                state: t.state,
+                docsUri: t.docsDestination?.exportUri,
+            })),
+        },
+    };
+}
+function formatRecordingList(data) {
+    const raw = data;
+    const items = (raw?.recordings ?? []);
+    if (items.length === 0) {
+        return { text: 'No recordings found.', refs: { count: 0 } };
+    }
+    const lines = items.map(r => {
+        const name = String(r.name ?? '');
+        const state = String(r.state ?? '');
+        const startTime = shortTime(r.startTime);
+        const endTime = shortTime(r.endTime);
+        const driveUri = r.driveDestination?.exportUri;
+        const drivePart = driveUri ? ` | [Drive](${driveUri})` : '';
+        return `${name} | ${state} | ${startTime} - ${endTime}${drivePart}`;
+    });
+    return {
+        text: `## Recordings (${items.length})\n\n${lines.join('\n')}`,
+        refs: {
+            count: items.length,
+            recordingName: String(items[0]?.name ?? ''),
+            recordings: items.map(r => ({
+                name: r.name,
+                state: r.state,
+                driveUri: r.driveDestination?.exportUri,
+            })),
+        },
+    };
+}
+function formatSmartNoteList(data) {
+    const raw = data;
+    const items = (raw?.smartNotes ?? []);
+    if (items.length === 0) {
+        return { text: 'No smart notes found.', refs: { count: 0 } };
+    }
+    const lines = items.map(n => {
+        const name = String(n.name ?? '');
+        const state = String(n.state ?? '');
+        const docsUri = n.docsDestination?.exportUri;
+        const docsPart = docsUri ? ` | [Docs](${docsUri})` : '';
+        return `${name} | ${state}${docsPart}`;
+    });
+    return {
+        text: `## Smart Notes (${items.length})\n\n${lines.join('\n')}`,
+        refs: {
+            count: items.length,
+            smartNoteName: String(items[0]?.name ?? ''),
+            smartNotes: items.map(n => ({
+                name: n.name,
+                state: n.state,
+                docsUri: n.docsDestination?.exportUri,
+            })),
+        },
+    };
+}
+/**
+ * Collapse consecutive entries by the same speaker into blocks.
+ * "Alice: Hello" + "Alice: world" → "**Alice** (time):\nHello\nworld"
+ */
+function collapseEntries(entries) {
+    const blocks = [];
+    let currentSpeaker = '';
+    let currentLines = [];
+    let currentTime = '';
+    for (const e of entries) {
+        if (e.participant !== currentSpeaker) {
+            if (currentSpeaker) {
+                blocks.push(`**${currentSpeaker}** (${currentTime}):\n${currentLines.join('\n')}`);
+            }
+            currentSpeaker = e.participant;
+            currentLines = [e.text];
+            currentTime = e.time;
+        }
+        else {
+            currentLines.push(e.text);
+        }
+    }
+    if (currentSpeaker) {
+        blocks.push(`**${currentSpeaker}** (${currentTime}):\n${currentLines.join('\n')}`);
+    }
+    return blocks;
+}
+// --- Detail formatters ---
+function formatTranscriptEntries(data) {
+    const raw = data;
+    const entries = (raw?.transcriptEntries ?? []);
+    if (entries.length === 0) {
+        return { text: 'No transcript entries found.', refs: { count: 0 } };
+    }
+    const resolved = entries.map(e => ({
+        participant: String(e.participantDisplayName ?? e.participant ?? ''),
+        text: String(e.text ?? ''),
+        time: shortTime(e.startTime),
+    }));
+    const blocks = collapseEntries(resolved);
+    return {
+        text: `## Transcript (${entries.length} entries)\n\n${blocks.join('\n\n')}`,
+        refs: {
+            count: entries.length,
+            entries: entries.map(e => ({
+                participant: e.participantDisplayName ?? e.participant,
+                text: e.text,
+                startTime: e.startTime,
+            })),
+        },
+    };
+}
+function formatConferenceDetail(data) {
+    const raw = data;
+    const name = String(raw.name ?? '');
+    const id = conferenceId(name);
+    const code = meetingCode(raw.space);
+    const start = shortTime(raw.startTime);
+    const end = shortTime(raw.endTime);
+    const dur = duration(raw.startTime, raw.endTime);
+    const parts = [`## Conference ${id}`];
+    if (code)
+        parts.push(`**Meeting code:** ${code}`);
+    parts.push(`**Time:** ${start} - ${end}`);
+    if (dur)
+        parts.push(`**Duration:** ${dur}`);
+    if (raw.expireTime)
+        parts.push(`**Expires:** ${shortTime(raw.expireTime)}`);
+    return {
+        text: parts.join('\n'),
+        refs: {
+            conferenceId: id,
+            meetingCode: code,
+            startTime: raw.startTime,
+            endTime: raw.endTime,
+        },
+    };
+}
+// --- Custom handlers ---
+/**
+ * getFullTranscript — chains transcripts.list → entries.list → format.
+ * Accepts a conferenceId and returns the full who-said-what transcript
+ * without requiring the agent to know resource name conventions.
+ */
+async function getFullTranscript(params, account) {
+    const confId = String(params.conferenceId ?? '');
+    if (!confId)
+        throw new Error('conferenceId is required for getFullTranscript');
+    const parent = confId.startsWith('conferenceRecords/') ? confId : `conferenceRecords/${confId}`;
+    // Step 1: List transcripts for this conference
+    const transcriptsData = await call('meet', 'conferenceRecords.transcripts.list', { parent }, { account });
+    const transcripts = (transcriptsData?.transcripts ?? []);
+    if (transcripts.length === 0) {
+        return {
+            text: 'No transcripts found for this conference. Transcripts require Workspace Business Standard+ and must be enabled before the meeting.',
+            refs: { conferenceId: confId, count: 0 },
+        };
+    }
+    // Step 2: Fetch transcript entries and participants in parallel
+    const transcriptName = String(transcripts[0].name ?? '');
+    const pageToken = params.pageToken ? String(params.pageToken) : undefined;
+    const entriesParams = { parent: transcriptName, pageSize: 100 };
+    if (pageToken)
+        entriesParams.pageToken = pageToken;
+    const [entriesData, participantsData] = await Promise.all([
+        call('meet', 'conferenceRecords.transcripts.entries.list', entriesParams, { account }),
+        call('meet', 'conferenceRecords.participants.list', { parent, pageSize: 100 }, { account }),
+    ]);
+    const entries = (entriesData?.transcriptEntries ?? []);
+    if (entries.length === 0) {
+        return {
+            text: `Transcript found (${transcriptName}) but no entries available yet. The transcript may still be processing.`,
+            refs: { conferenceId: confId, transcriptName, count: 0 },
+        };
+    }
+    // Step 3: Build participant ID → display name map
+    const participants = (participantsData?.participants ?? []);
+    const nameMap = new Map();
+    for (const p of participants) {
+        const name = String(p.name ?? '');
+        const signedin = p.signedinUser;
+        const anon = p.anonymousUser;
+        const phone = p.phoneUser;
+        const displayName = String(signedin?.displayName ?? anon?.displayName ?? phone?.displayName ?? '');
+        if (name && displayName)
+            nameMap.set(name, displayName);
+    }
+    // Step 4: Format who-said-what with resolved names, collapsed by speaker
+    const resolved = entries.map(e => {
+        const rawParticipant = String(e.participant ?? '');
+        return {
+            participant: e.participantDisplayName
+                ? String(e.participantDisplayName)
+                : nameMap.get(rawParticipant) ?? rawParticipant.split('/').pop() ?? rawParticipant,
+            text: String(e.text ?? ''),
+            time: shortTime(e.startTime),
+        };
+    });
+    const blocks = collapseEntries(resolved);
+    const nextPageToken = entriesData.nextPageToken ? String(entriesData.nextPageToken) : null;
+    const docsUri = transcripts[0].docsDestination?.exportUri;
+    const isFirstPage = !pageToken;
+    const isLastPage = !nextPageToken;
+    const footer = [];
+    if (docsUri && (isFirstPage || isLastPage)) {
+        footer.push(`\n\n[Full transcript in Google Docs](${docsUri})`);
+    }
+    if (nextPageToken) {
+        footer.push(`\n\n**More entries available.** Continue with: \`manage_meet\` — \`{"operation":"getFullTranscript","email":"${account}","conferenceId":"${confId}","pageToken":"${nextPageToken}"}\``);
+    }
+    return {
+        text: `## Transcript (${entries.length} entries)\n\n${blocks.join('\n\n')}${footer.join('')}`,
+        refs: {
+            conferenceId: confId,
+            transcriptName,
+            count: entries.length,
+            nextPageToken,
+            docsUri: docsUri ?? null,
+            entries: entries.map(e => {
+                const raw = String(e.participant ?? '');
+                return {
+                    participant: e.participantDisplayName ?? nameMap.get(raw) ?? raw,
+                    text: e.text,
+                    startTime: e.startTime,
+                };
+            }),
+        },
+    };
+}
+/**
+ * Prefix a bare conference ID with "conferenceRecords/".
+ *
+ * Meet's API takes full resource names ("conferenceRecords/abc"); agents pass
+ * bare IDs. This is OUR opinion, applied in OUR layer — exactly where it belongs.
+ *
+ * It used to do this by re-serialising an argv slot's JSON. The seam now carries
+ * params, so it is a plain object transform (ADR-103).
+ *
+ * Note these values are precisely the ones that must reach the wire with their
+ * slash INTACT: Meet's paths are `{+name}` / `{+parent}`, RFC 6570 reserved
+ * expansion, and percent-encoding that `/` 404s every Meet sub-resource call. The
+ * client honours the `+`; see src/google/client.ts.
+ */
+function prefixResourceName(params, paramKey, prefix) {
+    const value = params[paramKey];
+    if (!value || String(value).startsWith(prefix))
+        return params;
+    return { ...params, [paramKey]: `${prefix}${value}` };
+}
+const prefixConferenceParent = async (params) => prefixResourceName(params, 'parent', 'conferenceRecords/');
+const prefixConferenceName = async (params) => prefixResourceName(params, 'name', 'conferenceRecords/');
+export const meetPatch = {
+    beforeExecute: {
+        listParticipants: prefixConferenceParent,
+        listTranscripts: prefixConferenceParent,
+        listRecordings: prefixConferenceParent,
+        listSmartNotes: prefixConferenceParent,
+        getConference: prefixConferenceName,
+    },
+    formatList: (data, ctx) => {
+        switch (ctx.operation) {
+            case 'listConferences':
+                return formatConferenceList(data);
+            case 'listParticipants':
+                return formatParticipantList(data);
+            case 'listTranscripts':
+                return formatTranscriptList(data);
+            case 'listTranscriptEntries':
+                return formatTranscriptEntries(data);
+            case 'listRecordings':
+                return formatRecordingList(data);
+            case 'listSmartNotes':
+                return formatSmartNoteList(data);
+            default: {
+                // Unknown list operation — return generic format rather than
+                // silently misformatting as a conference list
+                const raw = data;
+                const items = Object.values(raw).find(Array.isArray) ?? [];
+                return {
+                    text: items.length > 0
+                        ? `## Results (${items.length})\n\n${JSON.stringify(items, null, 2)}`
+                        : 'No results found.',
+                    refs: { count: items.length },
+                };
+            }
+        }
+    },
+    formatDetail: (data, ctx) => {
+        switch (ctx.operation) {
+            case 'getConference':
+                return formatConferenceDetail(data);
+            default: {
+                // For getTranscript, getRecording, getSmartNote — default detail is fine
+                // but enrich refs with the resource name for chaining
+                const raw = data;
+                const name = String(raw.name ?? '');
+                const parts = [`## ${ctx.operation.replace('get', '')}`];
+                for (const [key, val] of Object.entries(raw)) {
+                    if (val === null || val === undefined || typeof val === 'object')
+                        continue;
+                    parts.push(`**${key}:** ${val}`);
+                }
+                return {
+                    text: parts.join('\n'),
+                    refs: { name, ...raw },
+                };
+            }
+        }
+    },
+    customHandlers: {
+        getFullTranscript,
+    },
+};
+//# sourceMappingURL=patch.js.map

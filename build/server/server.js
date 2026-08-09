@@ -1,0 +1,235 @@
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema, } from '@modelcontextprotocol/sdk/types.js';
+import { toolSchemas } from './tools.js';
+import { handleToolCall } from './handler.js';
+import { GoogleApiError } from '../google/errors.js';
+import { nextSteps } from './formatting/next-steps.js';
+import { manifest } from '../factory/registry.js';
+import { checkWorkspaceStatus } from '../executor/workspace.js';
+import { VERSION } from '../version.js';
+import { configurePolicies, getActivePolicies, draftOnlyEmail, noDelete, readOnly, auditLog, } from '../factory/safety.js';
+function log(msg) {
+    process.stderr.write(`[google-workspace-mcp] ${msg}\n`);
+}
+/** Configure safety policies from the GWS_SAFETY_POLICY env var. */
+function initSafetyPolicies() {
+    const policyEnv = process.env.GWS_SAFETY_POLICY || '';
+    if (!policyEnv)
+        return;
+    const policyMap = {
+        'draft-only-email': draftOnlyEmail,
+        'no-delete': noDelete,
+        'read-only': readOnly,
+        'audit': auditLog,
+    };
+    const names = policyEnv.split(',').map(s => s.trim()).filter(Boolean);
+    const unknown = names.filter(name => !policyMap[name]);
+    if (unknown.length > 0) {
+        const valid = Object.keys(policyMap).join(', ');
+        throw new Error(`Unknown safety policy(ies): ${unknown.join(', ')}. ` +
+            `Valid policies: ${valid}`);
+    }
+    const policies = names.map(name => policyMap[name]);
+    configurePolicies(policies);
+}
+export function createServer() {
+    initSafetyPolicies();
+    log(`startup: ${toolSchemas.length} tools loaded`);
+    const server = new Server({
+        name: '@aaronsb/google-workspace-mcp',
+        version: VERSION,
+    }, {
+        capabilities: {
+            tools: {},
+            resources: {},
+        },
+    });
+    server.setRequestHandler(ListToolsRequestSchema, async () => {
+        return {
+            tools: toolSchemas.map(tool => ({
+                name: tool.name,
+                description: tool.description,
+                inputSchema: tool.inputSchema,
+            })),
+        };
+    });
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        const { name, arguments: args } = request.params;
+        try {
+            log(`call: ${name} ${JSON.stringify(args ?? {}).slice(0, 200)}`);
+            const result = await handleToolCall(name, (args ?? {}));
+            log(`done: ${name}`);
+            const content = [{ type: 'text', text: result.text }];
+            if (result.content) {
+                for (const block of result.content) {
+                    content.push({ type: block.type, data: block.data, mimeType: block.mimeType });
+                }
+            }
+            return { content };
+        }
+        catch (err) {
+            if (err instanceof GoogleApiError) {
+                // Read the auth failure from Google, not from an invented status code.
+                // Google states the problem directly: 401 means the token is bad; a 403 whose
+                // reason is a permissions/scope failure means the token is valid but does
+                // not carry the scope this call needs. Both are fixed by re-consenting.
+                // (ADR-103, item 7.)
+                const email = args?.email;
+                const guidance = err.isAuthError
+                    ? nextSteps('accounts', 'auth_error', email ? { email } : undefined)
+                    : '';
+                return {
+                    content: [{ type: 'text', text: JSON.stringify({
+                                error: err.message, // Google's message, written for an API caller
+                                status: err.status, // the HTTP status, not an invented exit code
+                                reason: err.reason, // e.g. notFound, insufficientPermissions, rateLimitExceeded
+                            }, null, 2) + guidance }],
+                    isError: true,
+                };
+            }
+            const message = err instanceof Error ? err.message : String(err);
+            return {
+                content: [{ type: 'text', text: `Error: ${message}` }],
+                isError: true,
+            };
+        }
+    });
+    // --- Resources ---
+    server.setRequestHandler(ListResourcesRequestSchema, async () => {
+        return {
+            resources: [
+                {
+                    uri: 'gws://safety/policies',
+                    name: 'Active Safety Policies',
+                    description: 'Current safety policies controlling what operations are allowed, blocked, or audited',
+                    mimeType: 'application/json',
+                },
+                {
+                    uri: 'gws://config/services',
+                    name: 'Available Services',
+                    description: 'Google Workspace services and operations available through this server',
+                    mimeType: 'application/json',
+                },
+                {
+                    uri: 'gws://config/workspace',
+                    name: 'Workspace Directory',
+                    description: 'File I/O workspace directory status and path',
+                    mimeType: 'application/json',
+                },
+                {
+                    uri: 'gws://config/version',
+                    name: 'Server Version',
+                    description: 'Build version of the google-workspace-mcp server',
+                    mimeType: 'application/json',
+                },
+            ],
+        };
+    });
+    server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+        const { uri } = request.params;
+        switch (uri) {
+            case 'gws://safety/policies': {
+                const policies = getActivePolicies();
+                const content = {
+                    active: policies.length > 0,
+                    policies: policies.map(p => ({
+                        name: p.name,
+                        description: p.description,
+                    })),
+                    summary: policies.length === 0
+                        ? 'No safety policies active — all operations are allowed.'
+                        : `${policies.length} policy(ies) active: ${policies.map(p => p.name).join(', ')}. ` +
+                            'Operations that violate these policies will be blocked with an explanation.',
+                };
+                return {
+                    contents: [{
+                            uri,
+                            mimeType: 'application/json',
+                            text: JSON.stringify(content, null, 2),
+                        }],
+                };
+            }
+            case 'gws://config/services': {
+                const services = Object.entries(manifest.services).map(([name, def]) => ({
+                    service: name,
+                    tool: def.tool_name,
+                    operations: Object.keys(def.operations),
+                    operationCount: Object.keys(def.operations).length,
+                }));
+                const content = {
+                    totalServices: services.length,
+                    totalOperations: services.reduce((sum, s) => sum + s.operationCount, 0),
+                    services,
+                };
+                return {
+                    contents: [{
+                            uri,
+                            mimeType: 'application/json',
+                            text: JSON.stringify(content, null, 2),
+                        }],
+                };
+            }
+            case 'gws://config/workspace': {
+                const status = checkWorkspaceStatus();
+                return {
+                    contents: [{
+                            uri,
+                            mimeType: 'application/json',
+                            text: JSON.stringify(status, null, 2),
+                        }],
+                };
+            }
+            case 'gws://config/version': {
+                return {
+                    contents: [{
+                            uri,
+                            mimeType: 'application/json',
+                            text: JSON.stringify({ name: '@aaronsb/google-workspace-mcp', version: VERSION }, null, 2),
+                        }],
+                };
+            }
+            default:
+                throw new Error(`Unknown resource: ${uri}`);
+        }
+    });
+    return server;
+}
+/** Warm up token cache on startup — prefetch access tokens for all accounts. */
+async function warmupAccounts() {
+    try {
+        const { listAccounts } = await import('../accounts/registry.js');
+        const { hasCredential } = await import('../accounts/credentials.js');
+        const { warmTokenCache } = await import('../accounts/token-service.js');
+        const accounts = await listAccounts();
+        if (accounts.length === 0) {
+            log('startup: no accounts configured');
+            return;
+        }
+        const withCreds = [];
+        for (const account of accounts) {
+            if (await hasCredential(account.email)) {
+                withCreds.push(account.email);
+            }
+            else {
+                log(`startup: ${account.email} — no credential file`);
+            }
+        }
+        if (withCreds.length > 0) {
+            log(`startup: warming tokens for ${withCreds.length} account(s)`);
+            await warmTokenCache(withCreds);
+            log(`startup: token warmup complete`);
+        }
+    }
+    catch (err) {
+        log(`startup: warmup failed (${err.message})`);
+    }
+}
+export async function startServer() {
+    const server = createServer();
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    // Non-blocking warmup — don't delay MCP handshake
+    warmupAccounts().catch(() => { });
+}
+//# sourceMappingURL=server.js.map

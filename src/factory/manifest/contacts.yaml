@@ -1,0 +1,67 @@
+tool_name: manage_contacts
+description: "Zoek en lees Google-contactgegevens (read-only)."
+requires_email: true
+google_service: people
+operations:
+
+  # searchContacts doorzoekt een door Google onderhouden cache die kort kan
+  # achterlopen op zeer recente wijzigingen (Google's eigen documentatie
+  # noemt dit expliciet) — voor de allernieuwste contacten kan 'list' een
+  # betrouwbaarder beeld geven. In de praktijk (bestaande, langer bestaande
+  # contacten) werkt search direct.
+  search:
+    type: list
+    description: "zoek contacten op naam, e-mailadres of andere tekst"
+    resource: people.searchContacts
+    params:
+      query:
+        type: string
+        description: "Zoekterm (naam, e-mailadres, etc.)"
+        required: true
+      readMask:
+        type: string
+        description: "Comma-separated velden om terug te geven (Google FieldMask)"
+        default: "names,emailAddresses,phoneNumbers,organizations,addresses,birthdays"
+      pageSize:
+        type: number
+        description: "Max aantal resultaten"
+        default: 10
+
+  get:
+    type: detail
+    description: "haal één contact op via resourceName"
+    resource: people.get
+    params:
+      resourceName:
+        type: string
+        description: "Contact resourceName (bijv. people/c12345) — te vinden via 'search' of 'list'"
+        required: true
+      personFields:
+        type: string
+        description: "Comma-separated velden om terug te geven (Google FieldMask)"
+        default: "names,emailAddresses,phoneNumbers,organizations,addresses,birthdays"
+
+  # resourceName is altijd 'people/me' — Google's connections.list ondersteunt
+  # geen ander resourceName, dus dit staat vast via defaults i.p.v. als param
+  # (voorkomt dat de aanroeper er per ongeluk iets anders in zet).
+  list:
+    type: list
+    description: "lijst alle contacten uit het eigen adresboek (paginated)"
+    resource: people.connections.list
+    defaults:
+      resourceName: people/me
+    params:
+      personFields:
+        type: string
+        description: "Comma-separated velden om terug te geven (Google FieldMask)"
+        default: "names,emailAddresses,phoneNumbers,organizations"
+      pageSize:
+        type: number
+        description: "Max resultaten per pagina (default 25, max 1000)"
+        default: 25
+        max: 1000
+
+  listGroups:
+    type: list
+    description: "lijst contactgroepen/labels"
+    resource: contactGroups.list
