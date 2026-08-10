@@ -4,11 +4,13 @@ requires_email: true
 google_service: people
 operations:
 
-  # searchContacts doorzoekt een door Google onderhouden cache die kort kan
-  # achterlopen op zeer recente wijzigingen (Google's eigen documentatie
-  # noemt dit expliciet) — voor de allernieuwste contacten kan 'list' een
-  # betrouwbaarder beeld geven. In de praktijk (bestaande, langer bestaande
-  # contacten) werkt search direct.
+  # searchContacts doorzoekt een door Google onderhouden cache die pas "warm"
+  # is na een eerste connections.list-aanroep op dit account — daarvóór geeft
+  # search stelselmatig 0 resultaten (geen foutmelding), ook voor contacten
+  # die al lang bestaan. Bevestigd via reproductie (2026-08-10): "Hans
+  # Stedehouder" gaf 0 hits vóór een list-call, en daarna direct het juiste
+  # resultaat voor exact dezelfde query. Draai bij twijfel eerst 'list' één
+  # keer per account/sessie om de cache op te warmen.
   search:
     type: list
     description: "zoek contacten op naam, e-mailadres of andere tekst"
@@ -65,3 +67,24 @@ operations:
     type: list
     description: "lijst contactgroepen/labels"
     resource: contactGroups.list
+
+  # Schrijfoperatie (2026-08-10, bewust toegevoegd — zie oauth.ts voor de
+  # bijbehorende scope-uitbreiding). resourceNamesToAdd komt bij Google aan als
+  # een array in de body; contactGroups.members.modify declareert in de
+  # descriptor alleen 'resourceName' als path-param, dus resourceNamesToAdd
+  # gaat vanzelf naar de body (zie client.ts splitParams) — patch.ts's
+  # beforeExecute-hook zet de hier binnenkomende comma-separated string om
+  # naar een array vlak vóór de aanroep.
+  addToGroup:
+    type: action
+    description: "voeg contacten toe aan een contactgroep/label (batch)"
+    resource: contactGroups.members.modify
+    params:
+      resourceName:
+        type: string
+        description: "Contactgroep resourceName (bijv. contactGroups/xxxx) — via 'listGroups' te vinden"
+        required: true
+      resourceNamesToAdd:
+        type: string
+        description: "Comma-separated people-resourceNames om toe te voegen (bijv. people/c123,people/c456)"
+        required: true

@@ -2,6 +2,10 @@ import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { exec, execFile } from 'node:child_process';
 import { platform } from 'node:os';
+import { writeFileSync } from 'node:fs';
+import { dirname, resolve as resolvePath } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/auth';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GOOGLE_USERINFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo';
@@ -20,10 +24,11 @@ export const SERVICE_SCOPE_MAP = {
         'https://www.googleapis.com/auth/meetings.space.readonly',
         'https://www.googleapis.com/auth/meetings.space.settings',
     ],
-    // Read-only by design (Design Decision 3 in the Google Contacts plan) — the
-    // manifest (contacts.yaml) exposes no create/update/delete operations, so a
-    // write scope would grant privilege the tool can never use.
-    contacts: ['https://www.googleapis.com/auth/contacts.readonly'],
+    // Upgraded from contacts.readonly to full read/write (2026-08-10) — the
+    // manifest (contacts.yaml) gained an 'addToGroup' operation (batch-apply a
+    // contact-group label), a deliberate, explicitly confirmed step beyond the
+    // original read-only design (Design Decision 3 in the Google Contacts plan).
+    contacts: ['https://www.googleapis.com/auth/contacts'],
 };
 const BASE_SCOPES = [
     'openid',
@@ -147,6 +152,17 @@ function listenForCallback(clientId, scopes, state) {
             redirectUri = `http://127.0.0.1:${addr.port}/callback`;
             const authUrl = buildAuthUrl(clientId, redirectUri, scopes, state);
             process.stderr.write(`[google-workspace-mcp] OAuth: opening browser for consent\n`);
+            // Best-effort debug dump — lets an operator (or an assistant without
+            // access to this process's stderr) retrieve the exact consent URL if
+            // the auto-opened browser doesn't surface it (headless host, blocked
+            // pop-up, wrong default browser, etc). Not sensitive: no client_secret
+            // or token in this URL, just client_id/scope/redirect_uri/state.
+            try {
+                writeFileSync(resolvePath(MODULE_DIR, 'last-oauth-url.txt'), authUrl, 'utf-8');
+            }
+            catch {
+                // best-effort only — never let this break the real auth flow
+            }
             openBrowser(authUrl);
         });
         timer = setTimeout(() => {

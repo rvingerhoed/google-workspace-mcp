@@ -112,6 +112,22 @@ function formatGroupList(data) {
     };
 }
 export const contactsPatch = {
+    beforeExecute: {
+        // contactGroups.members.modify needs resourceNamesToAdd as an ARRAY in the
+        // body; the manifest param is a comma-separated string (the factory's
+        // param type system has no 'array' — see ParamDef in factory/types.ts),
+        // so split it here, the one place hooks are allowed to mutate params
+        // (ADR-103).
+        addToGroup: (params) => {
+            const raw = params.resourceNamesToAdd;
+            if (typeof raw !== 'string')
+                return params;
+            return {
+                ...params,
+                resourceNamesToAdd: raw.split(',').map((s) => s.trim()).filter(Boolean),
+            };
+        },
+    },
     formatList: (data, ctx) => {
         if (ctx.operation === 'listGroups')
             return formatGroupList(data);
