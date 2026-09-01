@@ -15,6 +15,19 @@ export function formatDefault(data, opDef) {
             return formatDefaultDetail(data);
     }
 }
+/**
+ * Google API envelope noise — present on nearly every resource but never
+ * meaningful content. `etag` is the sharpest trap: it is Google's cache-
+ * validation token, but it arrives pre-quoted (e.g. `"K28p0F-gF7o"`) and
+ * short, so positionally it looks exactly like a second, friendlier ID
+ * sitting right next to the real one. A caller who has no schema for the
+ * resource (i.e. an LLM reading this text) has no way to tell them apart
+ * and will reach for the wrong one — which is exactly what happened with
+ * Tasks: `listTaskLists` printed `id | kind | etag | title | updated`,
+ * and the etag got used as if it were the task list ID, failing every
+ * subsequent `list`/`get`/`complete` call with "Invalid task list ID".
+ */
+const ENVELOPE_NOISE_KEYS = new Set(['etag', 'kind', 'selfLink']);
 /** Generic list formatter — renders array items as pipe-delimited rows. */
 function formatDefaultList(data) {
     const raw = data;
@@ -29,7 +42,7 @@ function formatDefaultList(data) {
         const parts = [id];
         // Include a few meaningful string fields
         for (const [key, val] of Object.entries(obj)) {
-            if (key === 'id')
+            if (key === 'id' || ENVELOPE_NOISE_KEYS.has(key))
                 continue;
             if (typeof val === 'string' && val.length < 100) {
                 parts.push(val);
